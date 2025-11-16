@@ -1,182 +1,83 @@
-```markdown
-# 基于CARLA的智能代理系统
+# 2D-CARLA-Tracking
 
-## 项目概述
+基于CARLA模拟器的2D目标跟踪系统，集成YOLO目标检测与轻量级SORT跟踪算法，实现对车辆、行人等交通参与者的实时感知与跟踪。
 
-本项目旨在利用神经网络技术，实现CARLA模拟器中车辆和行人的全栈智能代理，涵盖感知、规划与控制三大核心模块。通过深度学习算法赋予虚拟智能体环境理解、决策规划和动态控制能力，同时包含具身人仿真、机械臂控制等扩展功能，构建多智能体协同的仿真系统。
+## 项目简介
+本项目旨在构建一个轻量、高效的2D目标跟踪框架，基于CARLA仿真环境提供真实交通场景数据，通过YOLO系列模型完成目标检测，结合自定义简易SORT跟踪器（无第三方跟踪库依赖）实现多目标持续跟踪，支持实时可视化跟踪结果。
 
 ## 环境配置
+* 平台：Windows 10/11，Ubuntu 20.04/22.04
+* 软件依赖：
+  - Python 3.7-3.12（兼容3.7+版本）
+  - CARLA Simulator 0.9.10+（需提前安装并启动）
+  - PyTorch（YOLO模型依赖，不使用Tensorflow）
 
-* **支持平台**：Windows 10/11，Ubuntu 20.04/22.04
-* **核心软件**：
-  * Python 3.7-3.12（需兼容3.7版本）
-  * PyTorch（优先采用，不依赖TensorFlow）
-  * CARLA 0.9.11+（推荐0.9.13/0.9.15版本）
-* **依赖安装**：
-  ```bash
-  # 基础依赖
-  pip install -r requirements.txt -i http://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com
-  
-  # CARLA客户端安装（需替换为对应版本）
-  pip install carla==0.9.15
-  
-  # 文档生成工具
-  pip install mkdocs
-  ```
-
-## 文档生成
-
-1. 安装文档工具链：
-   ```bash
-   pip install mkdocs -i http://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com
-   pip install -r requirements.txt
-   ```
-
-2. 构建并预览文档：
-   ```bash
-   # 进入项目根目录
-   cd nn
-   
-   # 构建静态文档
-   mkdocs build
-   
-   # 启动本地文档服务
-   mkdocs serve
-   ```
-
-3. 浏览器访问 [http://127.0.0.1:8000](http://127.0.0.1:8000) 查看文档。
-
-## 核心功能模块
-
-1. **车辆智能代理**
-   * **感知系统**：基于CNN的目标检测（车辆、行人、交通信号灯）、车道线识别
-   * **规划系统**：全局路径规划（A*、RRT*算法）、局部避障
-   * **控制系统**：强化学习车辆控制（油门、刹车、转向）、PID参数自适应调优
-   * **手动控制**：支持键盘操作的车辆交互模式（WASD控制方向，空格/左Shift控制升降）
-
-2. **具身人仿真**
-   * **感知模块**：william开发的具身人环境感知系统（`humanoid_perception`）
-   * **运动模拟**：基于Mujoco的物理引擎实现具身人运动控制（`Mujoco_manrun`）
-
-3. **神经网络模型**
-   * **CNN模型**：图像识别与目标检测（`chap05_CNN`），包含完整训练流程（Adam优化器、交叉熵损失）
-   * **RNN模型**：序列数据处理与生成（`chap06_RNN`），基于LSTM实现唐诗生成等文本任务
-   * **FNN模型**：基础神经网络结构（`chap04_simple_neural_network`），包含测试评估函数
-
-4. **辅助系统**
-   * **车道辅助**：Active-Lane-Keeping-Assistant实现车道偏离预警与辅助
-   * **机械臂测试**：humantest模块提供机械臂力控仿真与交互功能
+### 安装步骤
+1. 安装Python 3.7-3.12环境（推荐3.9+）
+2. 克隆本仓库：
+```shell
+git clone https://github.com/haruDT/2d-carla-tracking.git
+cd 2d-carla-tracking
+```
+3. 安装依赖包（使用阿里云镜像加速）：
+```shell
+pip install -r requirements.txt -i http://mirrors.aliyun.com/pypi/simple --trusted-host mirrors.aliyun.com
+```
+4. 安装CARLA Simulator：
+   - 参考[CARLA官方文档](https://carla.readthedocs.io/en/latest/start_quickstart/)下载对应平台的CARLA安装包
+   - 解压后启动CARLA服务器（默认端口2000）：
+     ```shell
+     # Windows
+     CarlaUE4.exe -windowed -ResX=800 -ResY=600
+     
+     # Ubuntu
+     ./CarlaUE4.sh -windowed -ResX=800 -ResY=600
+     ```
 
 ## 快速启动
+1. 确保CARLA服务器已启动（端口默认2000，若修改端口需在启动命令中指定）
+2. 运行主程序：
+```shell
+# 默认参数（本地CARLA服务器、30辆NPC车辆）
+python main.py
 
-1. 启动CARLA服务器：
-   ```bash
-   # Linux
-   ./CarlaUE4.sh
-   
-   # Windows
-   CarlaUE4.exe
-   ```
-
-2. 运行示例场景：
-   ```bash
-   # 自动驾驶车辆（强化学习）
-   python src/driverless_car/main.py
-   
-   # 车辆手动控制
-   python src/manual_control/main.py
-   
-   # CNN模型训练
-   python src/chap05_CNN/CNN_pytorch.py
-   
-   # RNN文本生成
-   python src/chap06_RNN/tangshi_for_pytorch/rnn.py
-   ```
-
-## 关键代码说明
-
-### 神经网络训练框架
-```python
-# CNN训练示例（chap05_CNN/CNN_pytorch.py）
-def train(cnn):
-    optimizer = torch.optim.Adam(cnn.parameters(), lr=learning_rate)
-    loss_func = nn.CrossEntropyLoss()
-    
-    for epoch in range(max_epoch):
-        for step, (x_, y_) in enumerate(train_loader):
-            x, y = Variable(x_), Variable(y_)
-            output = cnn(x)
-            loss = loss_func(output, y)
-            optimizer.zero_grad(set_to_none=True)
-            loss.backward()
-            optimizer.step()
-            
-            if step != 0 and step % 20 == 0:
-                print(f"测试准确率: {test(cnn)}")
+# 自定义参数示例（指定CARLA服务器地址、端口、NPC数量）
+python main.py --host=localhost --port=2001 --num_npcs=50
 ```
+3. 查看跟踪结果：
+   - 程序启动后会自动生成主车辆、NPC车辆及相机传感器
+   - 实时显示跟踪窗口，绿色框为跟踪目标，标注唯一跟踪ID
+   - 按`q`键退出程序
 
-### 强化学习智能体
-```python
-# 车辆强化学习（driverless_car/main.py）
-def main():
-    env = DroneEnv()
-    agent = Agent()
-    episodes = 1000
-    epsilon = 1.0  # 探索率
-    
-    for episode in range(episodes):
-        state = env.reset()
-        total_reward = 0
-        
-        while True:
-            action = agent.get_action(state, epsilon)  # 根据状态和探索率获取动作
-            next_state, reward, done = env.step(action)
-            agent.remember(state, action, reward, next_state, done)  # 存储经验
-            agent.train(batch_size=32)  # 训练模型
-            
-            if done:
-                epsilon = max(0.01, epsilon * 0.995)  # 衰减探索率
-                break
+## 核心功能
+- **CARLA环境交互**：自动生成交通参与者、挂载相机传感器、同步仿真控制
+- **目标检测**：集成YOLO系列模型（默认YOLOv5s），精准检测车辆（轿车、公交、卡车）、行人等目标
+- **轻量级跟踪**：内置简易SORT跟踪器（基于卡尔曼滤波+IOU匹配），无额外第三方依赖
+- **实时可视化**：动态绘制跟踪框与ID，直观展示跟踪效果
+
+## 代码结构
 ```
-
-### RNN模型结构
-```python
-# 唐诗生成RNN（chap06_RNN/tangshi_for_pytorch/rnn.py）
-class RNN_model(nn.Module):
-    def __init__(self, batch_sz, vocab_len, word_embedding, embedding_dim, lstm_hidden_dim):
-        super(RNN_model, self).__init__()
-        self.word_embedding_lookup = word_embedding
-        self.rnn_lstm = nn.LSTM(input_size=embedding_dim, 
-                                hidden_size=lstm_hidden_dim, 
-                                num_layers=2, 
-                                batch_first=False)
-        self.fc = nn.Linear(lstm_hidden_dim, vocab_len)
-        self.softmax = nn.LogSoftmax(dim=1)
-        
-    def forward(self, sentence, is_test=False):
-        batch_input = self.word_embedding_lookup(sentence).view(1, -1, self.word_embedding_dim)
-        h0 = torch.zeros(2, batch_input.size(1), self.lstm_dim)
-        c0 = torch.zeros(2, batch_input.size(1), self.lstm_dim)
-        
-        output, (hn, cn) = self.rnn_lstm(batch_input, (h0, c0))
-        out = self.fc(output.contiguous().view(-1, self.lstm_dim))
-        return self.softmax(out)
+2d-carla-tracking/
+├── main.py               # 主程序（环境初始化、检测跟踪流程、可视化）
+├── requirements.txt      # 依赖包清单
+└── README.md             # 项目文档
 ```
 
 ## 贡献指南
-
-请在提交代码前阅读 [贡献指南](https://github.com/OpenHUTB/.github/blob/master/CONTRIBUTING.md)，代码优化方向包括：
-
-* 遵循 [PEP 8 代码风格](https://peps.pythonlang.cn/pep-0008/) 并完善注释
-* 实现神经网络在CARLA场景中的端到端应用
-* 撰写模块功能说明与API文档
-* 添加自动化测试（模型性能、场景稳定性、数据一致性）
-* 优化感知-规划-控制链路的实时性
+准备提交代码之前，请阅读以下规范：
+1. 代码风格：遵循[PEP 8 编码规范](https://peps.pythonlang.cn/pep-0008/)，添加清晰注释
+2. 功能优化方向：
+   - 扩展目标类别（如自行车、摩托车等）
+   - 优化跟踪算法（集成DeepSORT、OCSORT等更优跟踪器）
+   - 提升检测性能（更换YOLOv8/YOLOv9等模型、量化压缩）
+   - 增加数据记录功能（保存检测跟踪结果用于离线分析）
+3. 提交要求：
+   - 撰写功能说明文档
+   - 添加自动化测试用例（参考[GitHub Actions Python测试指南](https://docs.github.com/zh/actions/use-cases-and-examples/building-and-testing/building-and-testing-python)）
+   - 确保代码可复现，兼容现有环境依赖
 
 ## 参考资源
-
-* [CARLA官方文档](https://carla.readthedocs.io/)
-* [PyTorch神经网络教程](https://pytorch.org/tutorials/)
-* [项目文档中心](https://openhutb.github.io/nn/)
-* [代理模拟器文档](https://openhutb.github.io/carla_doc/)
-* [神经网络原理](https://github.com/OpenHUTB/neuro)
+- [CARLA官方文档](https://carla.readthedocs.io/)
+- [YOLO官方仓库](https://github.com/ultralytics/ultralytics)
+- [SORT跟踪算法原论文](https://arxiv.org/abs/1602.00763)
+- [卡尔曼滤波原理与实现](https://github.com/OpenHUTB/neuro)
