@@ -1,0 +1,17 @@
+host: localhost
+port: 2000
+num_npcs: 15
+img_width: 640
+img_height: 480
+conf_thres: 0.3
+iou_thres: 0.3
+max_age: 8
+min_hits: 3
+yolo_imgsz_max: 480
+yolo_iou: 0.45
+kf_dt: 0.05
+max_speed: 50.0
+window_width: 800
+window_height: 480
+smooth_alpha: 0.2
+fps_window_size: 15
