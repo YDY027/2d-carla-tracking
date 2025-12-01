@@ -16,3 +16,13 @@ window_height: 720
 smooth_alpha: 0.2
 fps_window_size: 15
 display_fps: 30  
+
+track_history_len: 20
+track_line_width: 2
+track_alpha: 0.6
+
+
+stop_speed_thresh: 1.0
+stop_frames_thresh: 5
+overtake_speed_ratio: 1.5
+overtake_dist_thresh: 50

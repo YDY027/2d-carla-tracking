@@ -12,13 +12,14 @@ import yaml
 from dataclasses import dataclass, field
 import threading
 from scipy.optimize import linear_sum_assignment
+import torch  # 新增：用于设备检测和模型优化
 
 # 简化日志配置
 logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # ==============================================================================
-# 配置类（精简）
+# 配置类（新增轨迹/行为分析配置）
 # ==============================================================================
 @dataclass
 class Config:
@@ -40,6 +41,17 @@ class Config:
     smooth_alpha: float = 0.2
     fps_window_size: int = 15
     display_fps: int = 30  # 固定显示帧率
+    
+    # 新增：轨迹可视化配置
+    track_history_len: int = 20  # 轨迹最大长度
+    track_line_width: int = 2    # 轨迹线宽
+    track_alpha: float = 0.6     # 轨迹透明度
+    
+    # 新增：行为分析配置
+    stop_speed_thresh: float = 1.0  # 停车速度阈值（像素/帧）
+    stop_frames_thresh: int = 5     # 判定停车的连续帧数
+    overtake_speed_ratio: float = 1.5  # 超车速度比（目标/自车）
+    overtake_dist_thresh: float = 50   # 超车判定距离（像素）
 
     @classmethod
     def from_yaml(cls, yaml_path: str = None) -> "Config":
@@ -75,7 +87,7 @@ class Config:
             return cls()
 
 # ==============================================================================
-# 核心算法（优化版+边界检查）
+# 核心算法（新增轨迹记录+行为分析）
 # ==============================================================================
 class KalmanFilter:
     def __init__(self, dt=0.05, max_speed=50.0):
@@ -124,15 +136,29 @@ class KalmanFilter:
         self.Q = np.diag([1+speed_factor*4]*4 + [5+speed_factor*20]*4).astype(np.float32)
 
 class Track:
-    def __init__(self, track_id, bbox, img_shape, kf_config):
+    def __init__(self, track_id, bbox, img_shape, kf_config, config):
         self.track_id = track_id
         self.kf = KalmanFilter(dt=kf_config["dt"], max_speed=kf_config["max_speed"])
         self.img_shape = img_shape
+        self.config = config  # 新增：保存配置
+        
         # 严格的边界检查
         if len(bbox) != 4:
             raise ValueError(f"bbox维度错误：期望4维，实际{len(bbox)}维")
         self.bbox = self._clip_bbox(bbox.astype(np.float32))
         self.kf.x[:4] = self.bbox
+        
+        # 新增：轨迹记录
+        self.track_history = []  # 存储目标中心坐标 [(x, y), ...]
+        self._update_track_history()
+        
+        # 新增：行为分析相关
+        self.speed_history = []  # 速度历史
+        self.is_stopped = False  # 是否停车
+        self.stop_frame_count = 0  # 连续停车帧数
+        self.is_overtaking = False  # 是否正在超车
+        self.overtake_frame_count = 0  # 连续超车帧数
+        
         self.hits = 1
         self.age = 0
         self.time_since_update = 0
@@ -147,6 +173,66 @@ class Track:
             max(bbox[1]+1, min(bbox[3], h-1))
         ], dtype=np.float32)
 
+    def _update_track_history(self):
+        """更新轨迹历史（仅保留最新N帧）"""
+        center_x = (self.bbox[0] + self.bbox[2]) / 2
+        center_y = (self.bbox[1] + self.bbox[3]) / 2
+        self.track_history.append((center_x, center_y))
+        # 限制轨迹长度
+        if len(self.track_history) > self.config.track_history_len:
+            self.track_history.pop(0)
+
+    def _calculate_speed(self):
+        """计算目标速度（像素/帧）"""
+        if len(self.track_history) < 2:
+            return 0.0
+        prev_center = self.track_history[-2]
+        curr_center = self.track_history[-1]
+        speed = np.linalg.norm(np.array(curr_center) - np.array(prev_center)) / self.kf.dt
+        self.speed_history.append(speed)
+        # 限制速度历史长度
+        if len(self.speed_history) > 5:
+            self.speed_history.pop(0)
+        return np.mean(self.speed_history)  # 平滑速度
+
+    def _analyze_behavior(self, ego_center):
+        """分析目标行为：停车/超车"""
+        # 1. 停车检测
+        current_speed = self._calculate_speed()
+        if current_speed < self.config.stop_speed_thresh:
+            self.stop_frame_count += 1
+            self.is_stopped = self.stop_frame_count >= self.config.stop_frames_thresh
+        else:
+            self.stop_frame_count = 0
+            self.is_stopped = False
+        
+        # 2. 超车检测
+        if ego_center is None or len(self.track_history) < 2:
+            self.is_overtaking = False
+            return
+        
+        # 计算目标与自车的相对位置和速度
+        target_center = self.track_history[-1]
+        ego_center_np = np.array(ego_center)
+        target_center_np = np.array(target_center)
+        
+        # 距离判断
+        dist = np.linalg.norm(target_center_np - ego_center_np)
+        if dist > self.config.overtake_dist_thresh:
+            self.overtake_frame_count = 0
+            self.is_overtaking = False
+            return
+        
+        # 速度判断（目标速度 > 自车速度 * 阈值）
+        ego_speed = 0.0
+        if hasattr(self, 'ego_speed') and self.ego_speed > 0:
+            if current_speed > self.ego_speed * self.config.overtake_speed_ratio:
+                self.overtake_frame_count += 1
+                self.is_overtaking = self.overtake_frame_count >= 3  # 连续3帧判定超车
+            else:
+                self.overtake_frame_count = 0
+                self.is_overtaking = False
+
     def predict(self):
         # 优化速度计算：考虑xy轴+时间维度
         prev_center = np.array([(self.kf.x[0]+self.kf.x[2])/2, (self.kf.x[1]+self.kf.x[3])/2])
@@ -157,18 +243,24 @@ class Track:
         
         self.bbox = self.kf.predict()
         self.bbox = self._clip_bbox(self.bbox)
+        self._update_track_history()  # 新增：预测后更新轨迹
         self.age += 1
         self.time_since_update += 1
         self.kf.update_noise_covariance(speed)
         return self.bbox
 
-    def update(self, bbox, cls_id):
+    def update(self, bbox, cls_id, ego_center=None):
+        """新增ego_center参数，用于行为分析"""
         if len(bbox) != 4:
             raise ValueError(f"更新bbox维度错误：期望4维，实际{len(bbox)}维")
         self.bbox = self.kf.update(self._clip_bbox(bbox))
+        self._update_track_history()  # 新增：更新后更新轨迹
         self.hits += 1
         self.time_since_update = 0
         self.cls_id = cls_id
+        
+        # 新增：行为分析
+        self._analyze_behavior(ego_center)
 
 class SimpleSORT:
     def __init__(self, config):
@@ -177,8 +269,12 @@ class SimpleSORT:
         self.iou_threshold = config.iou_thres
         self.img_shape = (config.img_height, config.img_width)
         self.kf_config = {"dt": config.kf_dt, "max_speed": config.max_speed}
+        self.config = config  # 保存配置
         self.tracks = []
         self.next_id = 1
+        
+        # 新增：自车中心（用于超车检测）
+        self.ego_center = None
 
     def _compute_iou(self, box1, box2):
         if len(box1) != 4 or len(box2) != 4:
@@ -193,11 +289,15 @@ class SimpleSORT:
         union_area = area1 + area2 - inter_area
         return inter_area / union_area if union_area > 0 else 0
 
-    def update(self, detections):
+    def update(self, detections, ego_center=None):
         """
         安全的更新函数：严格校验检测结果格式
         detections: np.array 每行格式 [x1,y1,x2,y2,conf,cls_id]
+        ego_center: tuple (x, y) 自车中心坐标（新增）
         """
+        # 新增：更新自车中心
+        self.ego_center = ego_center
+
         # 1. 严格的格式校验
         valid_detections = []
         if detections is not None and len(detections) > 0:
@@ -223,7 +323,7 @@ class SimpleSORT:
         if len(self.tracks) == 0 and len(valid_detections) > 0:
             for det in valid_detections:
                 try:
-                    self.tracks.append(Track(self.next_id, det[:4], self.img_shape, self.kf_config))
+                    self.tracks.append(Track(self.next_id, det[:4], self.img_shape, self.kf_config, self.config))
                     self.next_id += 1
                 except Exception as e:
                     logger.warning(f"轨迹初始化失败: {str(e)[:30]}")
@@ -258,17 +358,19 @@ class SimpleSORT:
             except Exception as e:
                 continue
 
-        # 7. 更新匹配的轨迹
+        # 7. 更新匹配的轨迹（新增ego_center）
         for track_idx, det_idx in matches:
             try:
-                self.tracks[track_idx].update(valid_detections[det_idx][:4], int(valid_detections[det_idx][5]))
+                self.tracks[track_idx].update(valid_detections[det_idx][:4], 
+                                             int(valid_detections[det_idx][5]), 
+                                             self.ego_center)
             except Exception as e:
                 logger.warning(f"轨迹更新失败: {str(e)[:30]}")
 
-        # 8. 新增未匹配的检测
+        # 8. 新增未匹配的检测（新增config参数）
         for det_idx in set(range(len(valid_detections))) - used_dets:
             try:
-                self.tracks.append(Track(self.next_id, valid_detections[det_idx][:4], self.img_shape, self.kf_config))
+                self.tracks.append(Track(self.next_id, valid_detections[det_idx][:4], self.img_shape, self.kf_config, self.config))
                 self.next_id += 1
             except Exception as e:
                 logger.warning(f"新增轨迹失败: {str(e)[:30]}")
@@ -293,16 +395,17 @@ class SimpleSORT:
             return np.array([]), np.array([]), np.array([])
 
 # ==============================================================================
-# 推理线程类（安全版）
+# 推理线程类（优化YOLO设备选择）
 # ==============================================================================
 class DetectionThread(threading.Thread):
-    def __init__(self, detector, config, input_queue, output_queue):
+    def __init__(self, detector, config, input_queue, output_queue, device="cpu"):
         super().__init__(daemon=True)
         self.detector = detector
         self.config = config
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.running = True
+        self.device = device  # 新增：指定推理设备
 
     def run(self):
         while self.running:
@@ -322,13 +425,13 @@ class DetectionThread(threading.Thread):
                 imgsz_w = make_divisible(int(w * ratio))
                 imgsz_h = make_divisible(int(h * ratio))
                 
-                # YOLO推理（带异常捕获）
+                # YOLO推理（带异常捕获，优化设备）
                 try:
                     results = self.detector.predict(
                         image,
                         conf=self.config.conf_thres,
                         verbose=False,
-                        device="cpu",  # 改为"0"使用GPU
+                        device=self.device,  # 使用指定设备
                         agnostic_nms=True,
                         imgsz=(imgsz_h, imgsz_w),
                         iou=self.config.yolo_iou
@@ -363,7 +466,7 @@ class DetectionThread(threading.Thread):
         self.running = False
 
 # ==============================================================================
-# 帧缓存+固定帧率管理器（解决闪烁核心）
+# 帧缓存+固定帧率管理器（无修改）
 # ==============================================================================
 class FrameBuffer:
     def __init__(self, default_size=(480, 640, 3)):
@@ -397,7 +500,7 @@ class FixedRateDisplay:
         self.last_display_time = time.time()
 
 # ==============================================================================
-# 工具函数（优化版+安全校验）
+# 工具函数（新增轨迹绘制+行为标签）
 # ==============================================================================
 class FPSCounter:
     def __init__(self, window_size=15):
@@ -413,11 +516,13 @@ class FPSCounter:
             self.fps = (len(self.times)-1) / (self.times[-1] - self.times[0])
         return self.fps
 
-def draw_bounding_boxes(image, boxes, ids, cls_ids, fps=0.0, detection_count=0):
-    """安全的绘制函数：严格校验输入格式"""
+def draw_bounding_boxes(image, boxes, ids, cls_ids, tracks, fps=0.0, detection_count=0, config=None):
+    """新增：轨迹绘制+行为标签"""
     # 1. 图像格式校验
     if image is None or len(image.shape) != 3 or image.shape[2] != 3:
         return np.zeros((480, 640, 3), dtype=np.uint8)
+    if config is None:
+        config = Config()
     
     # 2. 预分配画布，避免频繁copy
     display_img = np.empty_like(image)
@@ -426,19 +531,25 @@ def draw_bounding_boxes(image, boxes, ids, cls_ids, fps=0.0, detection_count=0):
     
     # 3. 绘制FPS和跟踪数（半透明背景，减少闪烁）
     overlay = display_img.copy()
-    cv2.rectangle(overlay, (10,10), (250,40), (0,0,0), -1)
+    cv2.rectangle(overlay, (10,10), (350,40), (0,0,0), -1)  # 加宽背景以显示行为统计
     cv2.addWeighted(overlay, 0.7, display_img, 0.3, 0, display_img)  # 半透明叠加
-    cv2.putText(display_img, f"FPS:{fps:.1f} | Tracks:{len(boxes)} | Dets:{detection_count}", 
+    
+    # 新增：统计行为数量
+    stop_count = sum(1 for t in tracks if t.is_stopped)
+    overtake_count = sum(1 for t in tracks if t.is_overtaking)
+    cv2.putText(display_img, 
+                f"FPS:{fps:.1f} | Tracks:{len(boxes)} | Dets:{detection_count} | Stop:{stop_count} | Overtake:{overtake_count}", 
                 (15,30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2, lineType=cv2.LINE_AA)
     
-    # 4. 绘制跟踪框（带严格格式校验）
-    if len(boxes) > 0 and len(ids) > 0 and len(cls_ids) > 0:
-        min_len = min(len(boxes), len(ids), len(cls_ids))
+    # 4. 绘制跟踪框+轨迹+行为标签（带严格格式校验）
+    if len(boxes) > 0 and len(ids) > 0 and len(cls_ids) > 0 and len(tracks) > 0:
+        min_len = min(len(boxes), len(ids), len(cls_ids), len(tracks))
         for i in range(min_len):
             try:
                 box = boxes[i]
                 track_id = ids[i]
                 cls_id = cls_ids[i]
+                track = tracks[i]
                 
                 # 校验box格式
                 if len(box) != 4:
@@ -455,15 +566,39 @@ def draw_bounding_boxes(image, boxes, ids, cls_ids, fps=0.0, detection_count=0):
                     (track_id * 127) % 256,
                     (track_id * 199) % 256
                 )
-                # 抗锯齿绘制
+                # 抗锯齿绘制框
                 cv2.rectangle(display_img, (int(x1),int(y1)), (int(x2),int(y2)), color, 2, lineType=cv2.LINE_AA)
+                
+                # 新增：绘制轨迹
+                if len(track.track_history) >= 2:
+                    # 创建轨迹叠加层（透明效果）
+                    track_overlay = display_img.copy()
+                    # 绘制轨迹线（最新点更亮）
+                    for j in range(1, len(track.track_history)):
+                        pt1 = (int(track.track_history[j-1][0]), int(track.track_history[j-1][1]))
+                        pt2 = (int(track.track_history[j][0]), int(track.track_history[j][1]))
+                        # 轨迹渐变（越新越粗/越亮）
+                        alpha = j / len(track.track_history) * config.track_alpha
+                        line_width = int(j / len(track.track_history) * config.track_line_width) + 1
+                        cv2.line(track_overlay, pt1, pt2, color, line_width, lineType=cv2.LINE_AA)
+                    # 叠加轨迹到主图像
+                    cv2.addWeighted(track_overlay, alpha, display_img, 1-alpha, 0, display_img)
+                
+                # 构建标签（新增行为信息）
                 cls_name = vehicle_classes.get(cls_id, "Unknown")
-                label = f"ID:{track_id} | {cls_name}"
+                behavior_tags = []
+                if track.is_stopped:
+                    behavior_tags.append("STOP")
+                if track.is_overtaking:
+                    behavior_tags.append("OVERTAKE")
+                behavior_str = " | " + " | ".join(behavior_tags) if behavior_tags else ""
+                label = f"ID:{track_id} | {cls_name}{behavior_str}"
                 
                 # 绘制标签背景（半透明）
                 label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
                 overlay = display_img.copy()
-                cv2.rectangle(overlay, (int(x1),int(y1)-20), (int(x1)+label_size[0]+10, int(y1)), color, -1)
+                # 加宽标签背景以容纳行为信息
+                cv2.rectangle(overlay, (int(x1),int(y1)-20), (int(x1)+label_size[0]+20, int(y1)), color, -1)
                 cv2.addWeighted(overlay, 0.8, display_img, 0.2, 0, display_img)
                 cv2.putText(display_img, label, (int(x1)+5, int(y1)-5), 
                             cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1, lineType=cv2.LINE_AA)
@@ -552,7 +687,7 @@ def spawn_npc_vehicles(world, num_npcs, spawn_points):
     return npc_count
 
 # ==============================================================================
-# 主函数（最终修复版）
+# 主函数（完整优化版）
 # ==============================================================================
 def main():
     # 解析参数 + 加载配置
@@ -632,11 +767,23 @@ def main():
         fps_counter = FPSCounter(window_size=config.fps_window_size)
         tracker = SimpleSORT(config)
         
-        # 初始化YOLO推理线程
-        detector = YOLO("yolov5s.pt")
+        # 初始化YOLO推理线程（优化版）
+        # 自动选择设备和模型
+        model_name = "yolov5su.pt"  # 升级为Ultralytics优化版
+        device = "cuda" if torch.cuda.is_available() else "cpu"
+        logger.info(f"使用YOLO模型: {model_name}, 推理设备: {device}")
+
+        # 初始化检测器并优化
+        detector = YOLO(model_name)
+        try:
+            detector.fuse()  # 融合层加速（仅GPU有效）
+            detector.to(device)
+        except Exception as e:
+            logger.warning(f"模型优化失败: {e}，使用默认配置")
+
         det_input_queue = queue.Queue(maxsize=2)
         det_output_queue = queue.Queue(maxsize=2)
-        det_thread = DetectionThread(detector, config, det_input_queue, det_output_queue)
+        det_thread = DetectionThread(detector, config, det_input_queue, det_output_queue, device)
         det_thread.start()
 
         # 生成NPC车辆
@@ -680,6 +827,9 @@ def main():
                     image = image_queue.get_nowait()
                     # 图像格式校验
                     if image is not None and len(image.shape) == 3 and image.shape[2] == 3:
+                        # 计算自车中心（图像中心，用于超车检测）
+                        ego_center = (image.shape[1] / 2, image.shape[0] / 2)
+                        tracker.ego_center = ego_center
                         # 将图像放入推理队列
                         if not det_input_queue.full():
                             det_input_queue.put(image.copy())
@@ -691,12 +841,16 @@ def main():
                     img, detections = det_output_queue.get_nowait()
                     # 严格的格式校验
                     if img is not None and len(img.shape) == 3 and img.shape[2] == 3:
-                        # 更新跟踪器
-                        tracked_boxes, tracked_ids, tracked_cls = tracker.update(detections)
-                        # 绘制结果
+                        # 计算自车中心
+                        ego_center = (img.shape[1] / 2, img.shape[0] / 2)
+                        # 更新跟踪器（传入自车中心）
+                        tracked_boxes, tracked_ids, tracked_cls = tracker.update(detections, ego_center)
+                        # 绘制结果（传入轨迹列表和配置）
                         display_img = draw_bounding_boxes(
                             img, tracked_boxes, tracked_ids, tracked_cls,
-                            fps_counter.update(), len(detections)
+                            tracker.tracks,  # 新增：传入完整轨迹信息
+                            fps_counter.update(), len(detections),
+                            config  # 新增：传入配置
                         )
                         # 更新帧缓存
                         frame_buffer.update(display_img)

@@ -1,6 +1,7 @@
-ultralytics>=8.0.0
-carla>=0.9.14
-opencv-python>=4.8.0
-numpy>=1.24.0
-pyyaml>=6.0.0
-scipy>=1.10.0  
+ultralytics>=8.0.0  # YOLOv5su依赖（需最新版支持）
+carla>=0.9.14       # CARLA仿真环境
+opencv-python>=4.8.0  # 图像处理
+numpy>=1.24.0       # 数值计算
+pyyaml>=6.0.0       # 配置文件解析
+scipy>=1.10.0       # 匈牙利算法、卡尔曼滤波依赖
+torch>=1.18.0       # PyTorch（GPU加速必需，支持CUDA）
