@@ -8,75 +8,142 @@ from ultralytics import YOLO
 import time
 import logging
 import os
+import sys
 import yaml
 from dataclasses import dataclass, field
 import threading
 from scipy.optimize import linear_sum_assignment
-import torch  # 新增：用于设备检测和模型优化
-
-# 简化日志配置
-logging.basicConfig(level=logging.WARNING, format='%(asctime)s - %(levelname)s - %(message)s')
-logger = logging.getLogger(__name__)
+import torch
 
 # ==============================================================================
-# 配置类（新增轨迹/行为分析配置）
+# 0. 环境检测与全局配置
+# ==============================================================================
+# 跨平台兼容
+PLATFORM = sys.platform
+IS_WINDOWS = PLATFORM.startswith('win')
+IS_LINUX = PLATFORM.startswith('linux')
+# 日志配置
+logging.basicConfig(
+    level=logging.WARNING,
+    format='%(asctime)s - %(levelname)s - %(message)s',
+    datefmt='%H:%M:%S'
+)
+logger = logging.getLogger(__name__)
+
+# 预设天气配置（CARLA官方天气参数）
+# 预设天气配置（兼容所有CARLA版本，仅保留基础参数）
+WEATHER_PRESETS = {
+    'clear': carla.WeatherParameters(
+        cloudiness=0.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=0.0, sun_azimuth_angle=180.0, sun_altitude_angle=75.0,
+        fog_density=0.0, fog_distance=0.0, fog_falloff=1.0,
+        wetness=0.0, scattering_intensity=0.0
+    ),
+    'rain': carla.WeatherParameters(
+        cloudiness=80.0, precipitation=80.0, precipitation_deposits=50.0,
+        wind_intensity=30.0, sun_azimuth_angle=180.0, sun_altitude_angle=45.0,
+        fog_density=20.0, fog_distance=50.0, fog_falloff=0.8,
+        wetness=80.0, scattering_intensity=0.5
+    ),
+    'fog': carla.WeatherParameters(
+        cloudiness=90.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=10.0, sun_azimuth_angle=180.0, sun_altitude_angle=30.0,
+        fog_density=70.0, fog_distance=20.0, fog_falloff=0.5,
+        wetness=10.0, scattering_intensity=0.8
+    ),
+    'night': carla.WeatherParameters(
+        cloudiness=20.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=0.0, sun_azimuth_angle=0.0, sun_altitude_angle=-90.0,  # 太阳高度角为负=夜晚
+        fog_density=10.0, fog_distance=100.0, fog_falloff=0.7,
+        wetness=0.0, scattering_intensity=1.0
+    ),
+    'cloudy': carla.WeatherParameters(
+        cloudiness=90.0, precipitation=0.0, precipitation_deposits=0.0,
+        wind_intensity=20.0, sun_azimuth_angle=180.0, sun_altitude_angle=60.0,
+        fog_density=10.0, fog_distance=100.0, fog_falloff=0.9,
+        wetness=0.0, scattering_intensity=0.3
+    ),
+    'snow': carla.WeatherParameters(
+        cloudiness=90.0, precipitation=90.0, precipitation_deposits=80.0,  # 低版本用precipitation模拟雪
+        wind_intensity=40.0, sun_azimuth_angle=180.0, sun_altitude_angle=20.0,
+        fog_density=30.0, fog_distance=30.0, fog_falloff=0.6,
+        wetness=50.0, scattering_intensity=0.7
+    )
+}
+
+# ==============================================================================
+# 1. 配置类（新增天气相关配置）
 # ==============================================================================
 @dataclass
 class Config:
+    # CARLA基础配置
     host: str = "localhost"
     port: int = 2000
     num_npcs: int = 10
     img_width: int = 640
     img_height: int = 480
+    
+    # 检测/跟踪核心配置
     conf_thres: float = 0.5
     iou_thres: float = 0.3
     max_age: int = 5
     min_hits: int = 3
-    yolo_imgsz_max: int = 320  # 降低尺寸提升速度
+    
+    # YOLO优化配置
+    yolo_model: str = "yolov8n.pt"
+    yolo_imgsz_max: int = 320
     yolo_iou: float = 0.45
+    
+    # 卡尔曼滤波配置
     kf_dt: float = 0.05
     max_speed: float = 50.0
+    
+    # 可视化配置
     window_width: int = 1280
     window_height: int = 720
     smooth_alpha: float = 0.2
     fps_window_size: int = 15
-    display_fps: int = 30  # 固定显示帧率
+    display_fps: int = 30
     
-    # 新增：轨迹可视化配置
-    track_history_len: int = 20  # 轨迹最大长度
-    track_line_width: int = 2    # 轨迹线宽
-    track_alpha: float = 0.6     # 轨迹透明度
+    # 轨迹/行为分析配置
+    track_history_len: int = 20
+    track_line_width: int = 2
+    track_alpha: float = 0.6
+    stop_speed_thresh: float = 1.0
+    stop_frames_thresh: int = 5
+    overtake_speed_ratio: float = 1.5
+    overtake_dist_thresh: float = 50.0
     
-    # 新增：行为分析配置
-    stop_speed_thresh: float = 1.0  # 停车速度阈值（像素/帧）
-    stop_frames_thresh: int = 5     # 判定停车的连续帧数
-    overtake_speed_ratio: float = 1.5  # 超车速度比（目标/自车）
-    overtake_dist_thresh: float = 50   # 超车判定距离（像素）
-
+    # 新增：天气配置
+    default_weather: str = "clear"  # 默认天气
+    auto_adjust_detection: bool = True  # 天气自适应检测
+    
     @classmethod
     def from_yaml(cls, yaml_path: str = None) -> "Config":
         try:
-            # 自动定位config.yaml（main.py同级目录）
-            yaml_path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
+            yaml_path = yaml_path or os.path.join(os.path.dirname(os.path.abspath(__file__)), "config.yaml")
             if not os.path.exists(yaml_path):
                 logger.warning("配置文件不存在，使用默认配置")
                 return cls()
 
             with open(yaml_path, "r", encoding="utf-8") as f:
                 data = yaml.safe_load(f.read().strip().replace("\t", "  "))
-                if not isinstance(data, dict):
-                    logger.warning("配置文件格式错误，使用默认配置")
-                    return cls()
+            if not isinstance(data, dict):
+                logger.warning("配置文件格式错误，使用默认配置")
+                return cls()
 
-            # 过滤有效参数并转换类型
             valid_keys = set(cls.__dataclass_fields__.keys())
             data = {k: v for k, v in data.items() if k in valid_keys}
+            # 类型转换
             for k, v in data.items():
                 try:
-                    if cls.__dataclass_fields__[k].type == int:
+                    field_type = cls.__dataclass_fields__[k].type
+                    if field_type == int:
                         data[k] = int(v)
-                    elif cls.__dataclass_fields__[k].type == float:
+                    elif field_type == float:
                         data[k] = float(v)
+                    elif field_type == bool:
+                        data[k] = bool(v)
                 except:
                     del data[k]
 
@@ -87,7 +154,79 @@ class Config:
             return cls()
 
 # ==============================================================================
-# 核心算法（新增轨迹记录+行为分析）
+# 2. 图像增强（天气自适应）
+# ==============================================================================
+class WeatherImageEnhancer:
+    """天气自适应图像增强器"""
+    def __init__(self, config):
+        self.config = config
+        self.current_weather = "clear"
+        # 不同天气的增强参数
+        self.enhance_params = {
+            'clear': {'brightness': 1.0, 'contrast': 1.0, 'gamma': 1.0},
+            'rain': {'brightness': 1.1, 'contrast': 1.2, 'gamma': 0.9, 'dehaze': True},
+            'fog': {'brightness': 1.3, 'contrast': 1.4, 'gamma': 0.8, 'dehaze': True},
+            'night': {'brightness': 1.5, 'contrast': 1.3, 'gamma': 0.7, 'denoise': True},
+            'cloudy': {'brightness': 1.2, 'contrast': 1.1, 'gamma': 1.0},
+            'snow': {'brightness': 1.1, 'contrast': 1.3, 'gamma': 0.9, 'dehaze': True}
+        }
+    
+    def set_weather(self, weather_name):
+        """设置当前天气"""
+        if weather_name in WEATHER_PRESETS:
+            self.current_weather = weather_name
+            logger.info(f"切换天气：{weather_name}，自动调整图像增强参数")
+    
+    def enhance(self, image):
+        """根据天气增强图像"""
+        if not self.config.auto_adjust_detection:
+            return image
+        
+        params = self.enhance_params.get(self.current_weather, self.enhance_params['clear'])
+        enhanced = image.copy()
+        
+        # 1. 亮度/对比度调整
+        alpha = params['contrast']  # 对比度
+        beta = int(params['brightness'] * 255 - 255)  # 亮度
+        enhanced = cv2.convertScaleAbs(enhanced, alpha=alpha, beta=beta)
+        
+        # 2. Gamma校正
+        gamma = params['gamma']
+        inv_gamma = 1.0 / gamma
+        gamma_table = np.array([((i / 255.0) ** inv_gamma) * 255 for i in range(256)]).astype(np.uint8)
+        enhanced = cv2.LUT(enhanced, gamma_table)
+        
+        # 3. 去雾（雾/雨/雪天）
+        if params.get('dehaze', False):
+            enhanced = self._dehaze(enhanced)
+        
+        # 4. 去噪（夜晚）
+        if params.get('denoise', False):
+            enhanced = cv2.fastNlMeansDenoisingColored(enhanced, None, 10, 10, 7, 21)
+        
+        return enhanced
+    
+    def _dehaze(self, image):
+        """快速去雾算法"""
+        # 简化版暗通道去雾
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        dark_channel = cv2.erode(gray, np.ones((7,7), np.uint8))
+        atmospheric_light = np.max(image[dark_channel < 10])
+        
+        # 透射率估计
+        t = 1 - 0.1 * (gray / atmospheric_light)
+        t = np.clip(t, 0.1, 1.0)
+        
+        # 去雾
+        dehazed = np.zeros_like(image, dtype=np.float32)
+        for c in range(3):
+            dehazed[:,:,c] = (image[:,:,c].astype(np.float32) - atmospheric_light) / t + atmospheric_light
+        dehazed = np.clip(dehazed, 0, 255).astype(np.uint8)
+        
+        return dehazed
+
+# ==============================================================================
+# 3. 核心算法（卡尔曼滤波+SORT跟踪）
 # ==============================================================================
 class KalmanFilter:
     def __init__(self, dt=0.05, max_speed=50.0):
@@ -140,7 +279,7 @@ class Track:
         self.track_id = track_id
         self.kf = KalmanFilter(dt=kf_config["dt"], max_speed=kf_config["max_speed"])
         self.img_shape = img_shape
-        self.config = config  # 新增：保存配置
+        self.config = config
         
         # 严格的边界检查
         if len(bbox) != 4:
@@ -148,16 +287,16 @@ class Track:
         self.bbox = self._clip_bbox(bbox.astype(np.float32))
         self.kf.x[:4] = self.bbox
         
-        # 新增：轨迹记录
-        self.track_history = []  # 存储目标中心坐标 [(x, y), ...]
+        # 轨迹记录
+        self.track_history = []
         self._update_track_history()
         
-        # 新增：行为分析相关
-        self.speed_history = []  # 速度历史
-        self.is_stopped = False  # 是否停车
-        self.stop_frame_count = 0  # 连续停车帧数
-        self.is_overtaking = False  # 是否正在超车
-        self.overtake_frame_count = 0  # 连续超车帧数
+        # 行为分析相关
+        self.speed_history = []
+        self.is_stopped = False
+        self.stop_frame_count = 0
+        self.is_overtaking = False
+        self.overtake_frame_count = 0
         
         self.hits = 1
         self.age = 0
@@ -174,30 +313,28 @@ class Track:
         ], dtype=np.float32)
 
     def _update_track_history(self):
-        """更新轨迹历史（仅保留最新N帧）"""
+        """更新轨迹历史"""
         center_x = (self.bbox[0] + self.bbox[2]) / 2
         center_y = (self.bbox[1] + self.bbox[3]) / 2
         self.track_history.append((center_x, center_y))
-        # 限制轨迹长度
         if len(self.track_history) > self.config.track_history_len:
             self.track_history.pop(0)
 
     def _calculate_speed(self):
-        """计算目标速度（像素/帧）"""
+        """计算目标速度"""
         if len(self.track_history) < 2:
             return 0.0
         prev_center = self.track_history[-2]
         curr_center = self.track_history[-1]
         speed = np.linalg.norm(np.array(curr_center) - np.array(prev_center)) / self.kf.dt
         self.speed_history.append(speed)
-        # 限制速度历史长度
         if len(self.speed_history) > 5:
             self.speed_history.pop(0)
-        return np.mean(self.speed_history)  # 平滑速度
+        return np.mean(self.speed_history)
 
     def _analyze_behavior(self, ego_center):
-        """分析目标行为：停车/超车"""
-        # 1. 停车检测
+        """分析目标行为"""
+        # 停车检测
         current_speed = self._calculate_speed()
         if current_speed < self.config.stop_speed_thresh:
             self.stop_frame_count += 1
@@ -206,35 +343,32 @@ class Track:
             self.stop_frame_count = 0
             self.is_stopped = False
         
-        # 2. 超车检测
+        # 超车检测
         if ego_center is None or len(self.track_history) < 2:
             self.is_overtaking = False
             return
         
-        # 计算目标与自车的相对位置和速度
         target_center = self.track_history[-1]
         ego_center_np = np.array(ego_center)
         target_center_np = np.array(target_center)
         
-        # 距离判断
         dist = np.linalg.norm(target_center_np - ego_center_np)
         if dist > self.config.overtake_dist_thresh:
             self.overtake_frame_count = 0
             self.is_overtaking = False
             return
         
-        # 速度判断（目标速度 > 自车速度 * 阈值）
         ego_speed = 0.0
         if hasattr(self, 'ego_speed') and self.ego_speed > 0:
             if current_speed > self.ego_speed * self.config.overtake_speed_ratio:
                 self.overtake_frame_count += 1
-                self.is_overtaking = self.overtake_frame_count >= 3  # 连续3帧判定超车
+                self.is_overtaking = self.overtake_frame_count >= 3
             else:
                 self.overtake_frame_count = 0
                 self.is_overtaking = False
 
     def predict(self):
-        # 优化速度计算：考虑xy轴+时间维度
+        # 优化速度计算
         prev_center = np.array([(self.kf.x[0]+self.kf.x[2])/2, (self.kf.x[1]+self.kf.x[3])/2])
         curr_center = np.array([(self.bbox[0]+self.bbox[2])/2, (self.bbox[1]+self.bbox[3])/2])
         pixel_speed = np.linalg.norm(curr_center - prev_center) / self.kf.dt
@@ -243,23 +377,20 @@ class Track:
         
         self.bbox = self.kf.predict()
         self.bbox = self._clip_bbox(self.bbox)
-        self._update_track_history()  # 新增：预测后更新轨迹
+        self._update_track_history()
         self.age += 1
         self.time_since_update += 1
         self.kf.update_noise_covariance(speed)
         return self.bbox
 
     def update(self, bbox, cls_id, ego_center=None):
-        """新增ego_center参数，用于行为分析"""
         if len(bbox) != 4:
             raise ValueError(f"更新bbox维度错误：期望4维，实际{len(bbox)}维")
         self.bbox = self.kf.update(self._clip_bbox(bbox))
-        self._update_track_history()  # 新增：更新后更新轨迹
+        self._update_track_history()
         self.hits += 1
         self.time_since_update = 0
         self.cls_id = cls_id
-        
-        # 新增：行为分析
         self._analyze_behavior(ego_center)
 
 class SimpleSORT:
@@ -269,11 +400,9 @@ class SimpleSORT:
         self.iou_threshold = config.iou_thres
         self.img_shape = (config.img_height, config.img_width)
         self.kf_config = {"dt": config.kf_dt, "max_speed": config.max_speed}
-        self.config = config  # 保存配置
+        self.config = config
         self.tracks = []
         self.next_id = 1
-        
-        # 新增：自车中心（用于超车检测）
         self.ego_center = None
 
     def _compute_iou(self, box1, box2):
@@ -290,19 +419,13 @@ class SimpleSORT:
         return inter_area / union_area if union_area > 0 else 0
 
     def update(self, detections, ego_center=None):
-        """
-        安全的更新函数：严格校验检测结果格式
-        detections: np.array 每行格式 [x1,y1,x2,y2,conf,cls_id]
-        ego_center: tuple (x, y) 自车中心坐标（新增）
-        """
-        # 新增：更新自车中心
+        """更新跟踪器"""
         self.ego_center = ego_center
 
         # 1. 严格的格式校验
         valid_detections = []
         if detections is not None and len(detections) > 0:
             for det in detections:
-                # 检查维度和数值有效性
                 if len(det) >= 6:
                     x1,y1,x2,y2,conf,cls_id = det[:6]
                     if (isinstance(x1, (int, float)) and isinstance(y1, (int, float)) and
@@ -334,7 +457,7 @@ class SimpleSORT:
             self.tracks = [t for t in self.tracks if t.time_since_update <= self.max_age]
             return self._format_results([t for t in self.tracks if t.hits >= self.min_hits])
 
-        # 5. 匈牙利算法匹配（安全版）
+        # 5. 匈牙利算法匹配
         try:
             iou_matrix = np.array([[self._compute_iou(t.bbox, d[:4]) for t in self.tracks] for d in valid_detections])
             cost_matrix = 1 - iou_matrix
@@ -358,7 +481,7 @@ class SimpleSORT:
             except Exception as e:
                 continue
 
-        # 7. 更新匹配的轨迹（新增ego_center）
+        # 7. 更新匹配的轨迹
         for track_idx, det_idx in matches:
             try:
                 self.tracks[track_idx].update(valid_detections[det_idx][:4], 
@@ -367,7 +490,7 @@ class SimpleSORT:
             except Exception as e:
                 logger.warning(f"轨迹更新失败: {str(e)[:30]}")
 
-        # 8. 新增未匹配的检测（新增config参数）
+        # 8. 新增未匹配的检测
         for det_idx in set(range(len(valid_detections))) - used_dets:
             try:
                 self.tracks.append(Track(self.next_id, valid_detections[det_idx][:4], self.img_shape, self.kf_config, self.config))
@@ -395,29 +518,31 @@ class SimpleSORT:
             return np.array([]), np.array([]), np.array([])
 
 # ==============================================================================
-# 推理线程类（优化YOLO设备选择）
+# 4. 推理线程类
 # ==============================================================================
 class DetectionThread(threading.Thread):
-    def __init__(self, detector, config, input_queue, output_queue, device="cpu"):
+    def __init__(self, detector, config, enhancer, input_queue, output_queue, device="cpu"):
         super().__init__(daemon=True)
         self.detector = detector
         self.config = config
+        self.enhancer = enhancer  # 新增：图像增强器
         self.input_queue = input_queue
         self.output_queue = output_queue
         self.running = True
-        self.device = device  # 新增：指定推理设备
+        self.device = device
 
     def run(self):
         while self.running:
             try:
                 image = self.input_queue.get(timeout=1.0)
-                # 图像格式校验
                 if image is None or len(image.shape) != 3 or image.shape[2] != 3:
                     self.output_queue.put((None, np.array([])))
                     continue
                 
-                h, w = image.shape[:2]
+                # 新增：天气自适应图像增强
+                image_enhanced = self.enhancer.enhance(image)
                 
+                h, w = image.shape[:2]
                 # 确保尺寸是32的整数倍
                 def make_divisible(x, divisor=32):
                     return (x + divisor - 1) // divisor * divisor
@@ -425,13 +550,13 @@ class DetectionThread(threading.Thread):
                 imgsz_w = make_divisible(int(w * ratio))
                 imgsz_h = make_divisible(int(h * ratio))
                 
-                # YOLO推理（带异常捕获，优化设备）
+                # YOLO推理
                 try:
                     results = self.detector.predict(
-                        image,
+                        image_enhanced,
                         conf=self.config.conf_thres,
                         verbose=False,
-                        device=self.device,  # 使用指定设备
+                        device=self.device,
                         agnostic_nms=True,
                         imgsz=(imgsz_h, imgsz_w),
                         iou=self.config.yolo_iou
@@ -441,7 +566,7 @@ class DetectionThread(threading.Thread):
                     self.output_queue.put((image, np.array([])))
                     continue
 
-                # 解析检测结果（安全版）
+                # 解析检测结果
                 detections = []
                 for r in results:
                     if hasattr(r, 'boxes') and r.boxes is not None:
@@ -466,7 +591,7 @@ class DetectionThread(threading.Thread):
         self.running = False
 
 # ==============================================================================
-# 帧缓存+固定帧率管理器（无修改）
+# 5. 帧缓存+固定帧率管理器
 # ==============================================================================
 class FrameBuffer:
     def __init__(self, default_size=(480, 640, 3)):
@@ -477,13 +602,13 @@ class FrameBuffer:
         self.lock = threading.Lock()
 
     def update(self, frame):
-        """线程安全更新帧（带格式校验）"""
+        """线程安全更新帧"""
         if frame is not None and len(frame.shape) == 3 and frame.shape[2] == 3:
             with self.lock:
                 self.current_frame = frame.copy()
 
     def get(self):
-        """获取当前帧（无锁快速读取）"""
+        """获取当前帧"""
         return self.current_frame.copy()
 
 class FixedRateDisplay:
@@ -500,7 +625,7 @@ class FixedRateDisplay:
         self.last_display_time = time.time()
 
 # ==============================================================================
-# 工具函数（新增轨迹绘制+行为标签）
+# 6. 工具函数
 # ==============================================================================
 class FPSCounter:
     def __init__(self, window_size=15):
@@ -516,32 +641,30 @@ class FPSCounter:
             self.fps = (len(self.times)-1) / (self.times[-1] - self.times[0])
         return self.fps
 
-def draw_bounding_boxes(image, boxes, ids, cls_ids, tracks, fps=0.0, detection_count=0, config=None):
-    """新增：轨迹绘制+行为标签"""
-    # 1. 图像格式校验
+def draw_bounding_boxes(image, boxes, ids, cls_ids, tracks, fps=0.0, detection_count=0, config=None, current_weather="clear"):
+    """绘制跟踪框+轨迹+行为标签+天气信息"""
     if image is None or len(image.shape) != 3 or image.shape[2] != 3:
         return np.zeros((480, 640, 3), dtype=np.uint8)
     if config is None:
         config = Config()
     
-    # 2. 预分配画布，避免频繁copy
     display_img = np.empty_like(image)
-    display_img[:] = image  # 更快的复制方式
+    display_img[:] = image
     vehicle_classes = {2: "Car", 5: "Bus", 7: "Truck"}
     
-    # 3. 绘制FPS和跟踪数（半透明背景，减少闪烁）
+    # 绘制FPS、跟踪数、天气信息
     overlay = display_img.copy()
-    cv2.rectangle(overlay, (10,10), (350,40), (0,0,0), -1)  # 加宽背景以显示行为统计
-    cv2.addWeighted(overlay, 0.7, display_img, 0.3, 0, display_img)  # 半透明叠加
+    cv2.rectangle(overlay, (10,10), (450,40), (0,0,0), -1)
+    cv2.addWeighted(overlay, 0.7, display_img, 0.3, 0, display_img)
     
-    # 新增：统计行为数量
+    # 统计行为数量
     stop_count = sum(1 for t in tracks if t.is_stopped)
     overtake_count = sum(1 for t in tracks if t.is_overtaking)
     cv2.putText(display_img, 
-                f"FPS:{fps:.1f} | Tracks:{len(boxes)} | Dets:{detection_count} | Stop:{stop_count} | Overtake:{overtake_count}", 
+                f"FPS:{fps:.1f} | Weather:{current_weather} | Tracks:{len(boxes)} | Dets:{detection_count} | Stop:{stop_count} | Overtake:{overtake_count}", 
                 (15,30), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,255,0), 2, lineType=cv2.LINE_AA)
     
-    # 4. 绘制跟踪框+轨迹+行为标签（带严格格式校验）
+    # 绘制跟踪框+轨迹+行为标签
     if len(boxes) > 0 and len(ids) > 0 and len(cls_ids) > 0 and len(tracks) > 0:
         min_len = min(len(boxes), len(ids), len(cls_ids), len(tracks))
         for i in range(min_len):
@@ -551,40 +674,33 @@ def draw_bounding_boxes(image, boxes, ids, cls_ids, tracks, fps=0.0, detection_c
                 cls_id = cls_ids[i]
                 track = tracks[i]
                 
-                # 校验box格式
                 if len(box) != 4:
                     continue
                 
                 x1,y1,x2,y2 = box
-                # 校验坐标有效性
                 if x1 >= x2 or y1 >= y2:
                     continue
                 
-                # 固定颜色（基于ID的哈希，避免闪烁）
+                # 固定颜色
                 color = (
                     (track_id * 59) % 256,
                     (track_id * 127) % 256,
                     (track_id * 199) % 256
                 )
-                # 抗锯齿绘制框
                 cv2.rectangle(display_img, (int(x1),int(y1)), (int(x2),int(y2)), color, 2, lineType=cv2.LINE_AA)
                 
-                # 新增：绘制轨迹
+                # 绘制轨迹
                 if len(track.track_history) >= 2:
-                    # 创建轨迹叠加层（透明效果）
                     track_overlay = display_img.copy()
-                    # 绘制轨迹线（最新点更亮）
                     for j in range(1, len(track.track_history)):
                         pt1 = (int(track.track_history[j-1][0]), int(track.track_history[j-1][1]))
                         pt2 = (int(track.track_history[j][0]), int(track.track_history[j][1]))
-                        # 轨迹渐变（越新越粗/越亮）
                         alpha = j / len(track.track_history) * config.track_alpha
                         line_width = int(j / len(track.track_history) * config.track_line_width) + 1
                         cv2.line(track_overlay, pt1, pt2, color, line_width, lineType=cv2.LINE_AA)
-                    # 叠加轨迹到主图像
                     cv2.addWeighted(track_overlay, alpha, display_img, 1-alpha, 0, display_img)
                 
-                # 构建标签（新增行为信息）
+                # 构建标签
                 cls_name = vehicle_classes.get(cls_id, "Unknown")
                 behavior_tags = []
                 if track.is_stopped:
@@ -594,10 +710,9 @@ def draw_bounding_boxes(image, boxes, ids, cls_ids, tracks, fps=0.0, detection_c
                 behavior_str = " | " + " | ".join(behavior_tags) if behavior_tags else ""
                 label = f"ID:{track_id} | {cls_name}{behavior_str}"
                 
-                # 绘制标签背景（半透明）
+                # 绘制标签背景
                 label_size = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
                 overlay = display_img.copy()
-                # 加宽标签背景以容纳行为信息
                 cv2.rectangle(overlay, (int(x1),int(y1)-20), (int(x1)+label_size[0]+20, int(y1)), color, -1)
                 cv2.addWeighted(overlay, 0.8, display_img, 0.2, 0, display_img)
                 cv2.putText(display_img, label, (int(x1)+5, int(y1)-5), 
@@ -608,12 +723,11 @@ def draw_bounding_boxes(image, boxes, ids, cls_ids, tracks, fps=0.0, detection_c
     return display_img
 
 def clear_actors(world, exclude=None):
-    """优化的actor清理函数，避免内存泄漏"""
+    """优化的actor清理函数"""
     exclude_ids = set(exclude) if exclude else set()
     actors = world.get_actors()
-    batch_size = 10  # 分批销毁
+    batch_size = 10
     
-    # 分类销毁
     vehicle_actors = [a for a in actors if a.type_id.startswith('vehicle.') and a.id not in exclude_ids]
     sensor_actors = [a for a in actors if a.type_id.startswith('sensor.') and a.id not in exclude_ids]
     
@@ -639,11 +753,9 @@ def clear_actors(world, exclude=None):
 
 def camera_callback(image, queue):
     try:
-        # 转换图像格式并去噪
         img_array = np.frombuffer(image.raw_data, dtype=np.uint8).reshape((image.height, image.width, 4))
         img_rgb = cv2.GaussianBlur(img_array[:,:,:3], (3,3), 0)
         
-        # 队列满时丢弃旧数据
         if queue.full():
             try:
                 queue.get_nowait()
@@ -667,7 +779,7 @@ def spawn_npc_vehicles(world, num_npcs, spawn_points):
     
     npc_count = 0
     used_spawns = set()
-    max_attempts = num_npcs * 3  # 最大尝试次数
+    max_attempts = num_npcs * 3
     
     for _ in range(max_attempts):
         if npc_count >= num_npcs or len(used_spawns) >= len(spawn_points):
@@ -687,7 +799,7 @@ def spawn_npc_vehicles(world, num_npcs, spawn_points):
     return npc_count
 
 # ==============================================================================
-# 主函数（完整优化版）
+# 7. 主函数（新增天气切换逻辑）
 # ==============================================================================
 def main():
     # 解析参数 + 加载配置
@@ -696,6 +808,7 @@ def main():
     parser.add_argument("--host", help="CARLA主机")
     parser.add_argument("--port", type=int, help="CARLA端口")
     parser.add_argument("--conf-thres", type=float, help="检测置信度")
+    parser.add_argument("--weather", help="初始天气 (clear/rain/fog/night/cloudy/snow)")
     args = parser.parse_args()
     config = Config.from_yaml(args.config)
 
@@ -706,6 +819,8 @@ def main():
         config.port = args.port
     if args.conf_thres:
         config.conf_thres = args.conf_thres
+    if args.weather and args.weather in WEATHER_PRESETS:
+        config.default_weather = args.weather
 
     # 连接CARLA
     try:
@@ -757,6 +872,13 @@ def main():
         camera = world.spawn_actor(camera_bp, camera_transform, attach_to=ego_vehicle)
         exclude_actors.append(camera.id)
 
+        # 初始化天气增强器
+        enhancer = WeatherImageEnhancer(config)
+        # 设置初始天气
+        initial_weather = config.default_weather
+        world.set_weather(WEATHER_PRESETS[initial_weather])
+        enhancer.set_weather(initial_weather)
+
         # 初始化队列、帧缓存、固定帧率器
         image_queue = queue.Queue(maxsize=3)
         camera.listen(lambda img: camera_callback(img, image_queue))
@@ -767,42 +889,52 @@ def main():
         fps_counter = FPSCounter(window_size=config.fps_window_size)
         tracker = SimpleSORT(config)
         
-        # 初始化YOLO推理线程（优化版）
-        # 自动选择设备和模型
-        model_name = "yolov5su.pt"  # 升级为Ultralytics优化版
+        # 初始化YOLO推理线程
         device = "cuda" if torch.cuda.is_available() else "cpu"
-        logger.info(f"使用YOLO模型: {model_name}, 推理设备: {device}")
+        logger.info(f"使用YOLO模型: {config.yolo_model}, 推理设备: {device}")
 
-        # 初始化检测器并优化
-        detector = YOLO(model_name)
+        detector = YOLO(config.yolo_model)
         try:
-            detector.fuse()  # 融合层加速（仅GPU有效）
+            detector.fuse()
             detector.to(device)
         except Exception as e:
             logger.warning(f"模型优化失败: {e}，使用默认配置")
 
         det_input_queue = queue.Queue(maxsize=2)
         det_output_queue = queue.Queue(maxsize=2)
-        det_thread = DetectionThread(detector, config, det_input_queue, det_output_queue, device)
+        # 传入图像增强器
+        det_thread = DetectionThread(detector, config, enhancer, det_input_queue, det_output_queue, device)
         det_thread.start()
 
         # 生成NPC车辆
         spawn_npc_vehicles(world, config.num_npcs, spawn_points)
 
-        # 初始化可视化窗口（Windows兼容版）
-        cv2.namedWindow("CARLA Tracking", cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_EXPANDED)
-        cv2.resizeWindow("CARLA Tracking", config.window_width, config.window_height)
-        cv2.setWindowProperty("CARLA Tracking", cv2.WND_PROP_TOPMOST, 1)
+        # 初始化可视化窗口
+        cv2.namedWindow("CARLA Tracking (Weather Adaptive)", cv2.WINDOW_NORMAL | cv2.WINDOW_GUI_EXPANDED)
+        cv2.resizeWindow("CARLA Tracking (Weather Adaptive)", config.window_width, config.window_height)
+        cv2.setWindowProperty("CARLA Tracking (Weather Adaptive)", cv2.WND_PROP_TOPMOST, 1)
         
-        # 预显示默认帧，避免窗口空白
+        # 预显示默认帧
         initial_frame = frame_buffer.get()
         initial_frame_resized = cv2.resize(initial_frame, (config.window_width, config.window_height), 
                                           interpolation=cv2.INTER_LINEAR)
-        cv2.imshow("CARLA Tracking", initial_frame_resized)
+        cv2.imshow("CARLA Tracking (Weather Adaptive)", initial_frame_resized)
         cv2.waitKey(1)
 
+        # 打印操作提示
+        logger.info("\n========== 操作提示 ==========")
+        logger.info("Q/ESC: 退出程序")
+        logger.info("S: 保存截图")
+        logger.info("1: 晴天 (clear)")
+        logger.info("2: 雨天 (rain)")
+        logger.info("3: 雾天 (fog)")
+        logger.info("4: 夜晚 (night)")
+        logger.info("5: 多云 (cloudy)")
+        logger.info("6: 雪天 (snow)")
+        logger.info("==============================")
+
         # 主循环
-        logger.info("程序启动成功，按Q/ESC退出，S保存截图")
+        current_weather = config.default_weather
         while True:
             world.tick()
             
@@ -819,18 +951,15 @@ def main():
                 except Exception as e:
                     logger.warning(f"视角更新失败: {str(e)[:30]}")
 
-            # 核心帧处理逻辑（安全版）
+            # 核心帧处理逻辑
             current_display_frame = frame_buffer.get()
             try:
                 # 1. 非阻塞获取相机图像
                 try:
                     image = image_queue.get_nowait()
-                    # 图像格式校验
                     if image is not None and len(image.shape) == 3 and image.shape[2] == 3:
-                        # 计算自车中心（图像中心，用于超车检测）
                         ego_center = (image.shape[1] / 2, image.shape[0] / 2)
                         tracker.ego_center = ego_center
-                        # 将图像放入推理队列
                         if not det_input_queue.full():
                             det_input_queue.put(image.copy())
                 except queue.Empty:
@@ -839,45 +968,65 @@ def main():
                 # 2. 非阻塞获取推理结果
                 try:
                     img, detections = det_output_queue.get_nowait()
-                    # 严格的格式校验
                     if img is not None and len(img.shape) == 3 and img.shape[2] == 3:
-                        # 计算自车中心
                         ego_center = (img.shape[1] / 2, img.shape[0] / 2)
-                        # 更新跟踪器（传入自车中心）
                         tracked_boxes, tracked_ids, tracked_cls = tracker.update(detections, ego_center)
-                        # 绘制结果（传入轨迹列表和配置）
+                        # 绘制结果（传入当前天气）
                         display_img = draw_bounding_boxes(
                             img, tracked_boxes, tracked_ids, tracked_cls,
-                            tracker.tracks,  # 新增：传入完整轨迹信息
+                            tracker.tracks,
                             fps_counter.update(), len(detections),
-                            config  # 新增：传入配置
+                            config, current_weather
                         )
-                        # 更新帧缓存
                         frame_buffer.update(display_img)
                         current_display_frame = display_img
                 except queue.Empty:
-                    # 无推理结果时，在缓存帧上绘制提示（不替换缓存）
                     current_display_frame = frame_buffer.get()
                     cv2.putText(current_display_frame, "Detecting...", (10, 70), 
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0,0,255), 2, lineType=cv2.LINE_AA)
 
-                # 3. 固定帧率刷新窗口（统一尺寸）
+                # 3. 固定帧率刷新窗口
                 if current_display_frame is not None and len(current_display_frame.shape) == 3:
                     display_frame_resized = cv2.resize(current_display_frame, 
                                                       (config.window_width, config.window_height),
                                                       interpolation=cv2.INTER_LINEAR)
-                    cv2.imshow("CARLA Tracking", display_frame_resized)
+                    cv2.imshow("CARLA Tracking (Weather Adaptive)", display_frame_resized)
                 display_controller.wait()
 
-                # 4. 键盘控制（独立处理，避免阻塞）
+                # 4. 键盘控制（新增天气切换）
                 key = cv2.waitKey(1) & 0xFF
                 if key == ord('q') or key == 27:  # Q/ESC退出
                     logger.info("用户请求退出")
                     break
                 elif key == ord('s'):  # S保存截图
-                    save_path = f"track_screenshot_{time.strftime('%Y%m%d_%H%M%S')}.png"
+                    save_path = f"track_screenshot_{current_weather}_{time.strftime('%Y%m%d_%H%M%S')}.png"
                     cv2.imwrite(save_path, frame_buffer.get())
                     logger.info(f"截图已保存: {save_path}")
+                # 天气切换快捷键
+                elif key == ord('1'):
+                    current_weather = "clear"
+                    world.set_weather(WEATHER_PRESETS[current_weather])
+                    enhancer.set_weather(current_weather)
+                elif key == ord('2'):
+                    current_weather = "rain"
+                    world.set_weather(WEATHER_PRESETS[current_weather])
+                    enhancer.set_weather(current_weather)
+                elif key == ord('3'):
+                    current_weather = "fog"
+                    world.set_weather(WEATHER_PRESETS[current_weather])
+                    enhancer.set_weather(current_weather)
+                elif key == ord('4'):
+                    current_weather = "night"
+                    world.set_weather(WEATHER_PRESETS[current_weather])
+                    enhancer.set_weather(current_weather)
+                elif key == ord('5'):
+                    current_weather = "cloudy"
+                    world.set_weather(WEATHER_PRESETS[current_weather])
+                    enhancer.set_weather(current_weather)
+                elif key == ord('6'):
+                    current_weather = "snow"
+                    world.set_weather(WEATHER_PRESETS[current_weather])
+                    enhancer.set_weather(current_weather)
 
             except Exception as e:
                 logger.warning(f"帧处理失败: {str(e)[:50]}")
