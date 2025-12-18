@@ -1,4 +1,18 @@
-import argparse, carla, queue, random, cv2, numpy as np, time, os, sys, yaml, threading, torch, csv, open3d as o3d, psutil
+import argparse
+import carla
+import queue
+import random
+import cv2
+import numpy as np
+import time
+import os
+import sys
+import yaml
+import threading
+import torch
+import csv
+import open3d as o3d
+import psutil
 from ultralytics import YOLO
 from dataclasses import dataclass
 from scipy.optimize import linear_sum_assignment
@@ -7,14 +21,23 @@ from numba import njit
 from loguru import logger
 from sklearn.cluster import DBSCAN
 
-# 通用工具函数
-def valid_img(img): return img is not None and len(img.shape)==3 and img.shape[2]==3 and img.size>0
+# ======================== 通用工具函数 ========================
+def valid_img(img): 
+    return img is not None and len(img.shape)==3 and img.shape[2]==3 and img.size>0
+
 def clip_box(bbox, img_shape):
     h,w = img_shape
-    return np.array([max(0,min(bbox[0],w-1)),max(0,min(bbox[1],h-1)),max(bbox[0]+1,min(bbox[2],w-1)),max(bbox[1]+1,min(bbox[3],h-1))], dtype=np.float32)
-def make_div(x, d=32): return (x + d -1) // d * d
+    return np.array([
+        max(0,min(bbox[0],w-1)),
+        max(0,min(bbox[1],h-1)),
+        max(bbox[0]+1,min(bbox[2],w-1)),
+        max(bbox[1]+1,min(bbox[3],h-1))
+    ], dtype=np.float32)
 
-# 常量配置
+def make_div(x, d=32): 
+    return (x + d -1) // d * d
+
+# ======================== 常量配置 ========================
 PLATFORM, IS_WIN, IS_LINUX = sys.platform, sys.platform.startswith('win'), sys.platform.startswith('linux')
 WEATHER = {
     'clear':carla.WeatherParameters(0.0,0.0,0.0,0.0,180.0,75.0,0.0,0.0,1.0,0.0,0.0),
@@ -26,7 +49,7 @@ WEATHER = {
 }
 VEHICLE_CLS = {2:"Car",5:"Bus",7:"Truck",-1:"Unknown"}
 
-# 配置类（保留所有参数）
+# ======================== 配置类（新增检测框样式配置） ========================
 @dataclass
 class Config:
     host, port, num_npcs = "localhost", 2000, 20
@@ -43,6 +66,14 @@ class Config:
     use_lidar, lidar_channels, lidar_range, lidar_points_per_second, fuse_lidar_vision = True,32,100.0,500000,True
     record_data, record_dir, record_format, record_fps, save_screenshots = True,"track_records","csv",10,False
     use_3d_visualization, pcd_view_size = True,800
+    
+    # 新增：检测框样式配置（匹配截图）
+    det_box_color: tuple = (255, 0, 0)  # 检测框颜色（蓝色）
+    det_box_thickness: int = 2           # 框线宽度
+    det_label_bg_color: tuple = (0, 0, 0)# 标签背景色（黑色）
+    det_label_text_color: tuple = (255, 255, 255)  # 标签文字色（白色）
+    det_label_font_scale: float = 0.5    # 字体大小
+    det_label_padding: int = 5           # 标签内边距
 
     @classmethod
     def from_yaml(cls, p=None):
@@ -59,7 +90,7 @@ class Config:
             return cls(**data)
         except: return cls()
 
-# 天气图像增强（完整保留）
+# ======================== 天气图像增强 ========================
 class WeatherEnhancer:
     def __init__(self, cfg):
         self.cfg = cfg; self.weather = "clear"
@@ -104,7 +135,7 @@ class WeatherEnhancer:
         _, sm = cv2.threshold(gray,200,255,cv2.THRESH_BINARY)
         return cv2.inpaint(img,sm,5,cv2.INPAINT_NS)
 
-# LiDAR处理（完整保留）
+# ======================== LiDAR处理 ========================
 class LiDARProc:
     def __init__(self, cfg):
         self.cfg = cfg; self.q = queue.Queue(maxsize=2); self.data, self.trans = None, None
@@ -138,7 +169,7 @@ class LiDARProc:
         pcd.colors = o3d.utility.Vector3dVector(cm)
         return pcd
 
-# 数据记录（完整保留）
+# ======================== 数据记录 ========================
 class Recorder:
     def __init__(self, cfg):
         self.cfg = cfg; self.dir = os.path.join(cfg.record_dir, datetime.now().strftime("%Y%m%d_%H%M%S"))
@@ -185,7 +216,7 @@ class Recorder:
                 try: f.close()
                 except: pass
 
-# 卡尔曼滤波（完整保留）
+# ======================== 卡尔曼滤波 ========================
 class KF:
     def __init__(self, dt=0.05, ms=50.0):
         self.dt = dt; self.ms = ms; self.x = np.zeros(8, dtype=np.float32)
@@ -211,7 +242,7 @@ class KF:
         sf = min(1.0, s/self.ms)
         self.Q = np.diag([1+sf*4]*4 + [5+sf*20]*4).astype(np.float32)
 
-# IOU计算（完整保留）
+# ======================== IOU计算 ========================
 @njit
 def iou(box1, box2):
     ix1 = max(box1[0], box2[0]); iy1 = max(box1[1], box2[1])
@@ -222,7 +253,7 @@ def iou(box1, box2):
     ua = a1+a2-ia
     return ia/ua if ua>0 else 0
 
-# 跟踪目标（完整保留）
+# ======================== 跟踪目标 ========================
 class Track:
     def __init__(self, tid, bbox, img_shape, kf_cfg, cfg):
         self.track_id = tid; self.kf = KF(dt=kf_cfg["dt"], ms=kf_cfg["max_speed"])
@@ -315,7 +346,7 @@ class Track:
         self._update_hist(); self.hits +=1; self.tsu =0; self.cls_id = cls_id; self.conf = conf
         self._analyze_behavior(ego_center)
 
-# SORT跟踪器（完整保留）
+# ======================== SORT跟踪器 ========================
 class SORT:
     def __init__(self, cfg):
         self.max_age = cfg.max_age; self.min_hits = cfg.min_hits; self.iou_th = cfg.iou_thres
@@ -374,7 +405,7 @@ class SORT:
             dets.append([x1,y1,x2,y2,0.8,2])
         return np.array(dets)
 
-# 检测线程（完整保留）
+# ======================== 检测线程 ========================
 class DetThread(threading.Thread):
     def __init__(self, det, cfg, enh, in_q, out_q, dev="cpu"):
         super().__init__(daemon=True)
@@ -407,7 +438,7 @@ class DetThread(threading.Thread):
             except: self.out_q.put((None, np.array([])))
     def stop(self): self.running = False
 
-# 可视化工具（完整保留）
+# ======================== 可视化工具（核心：优化检测框绘制） ========================
 class FrameBuf:
     def __init__(self, sz=(480,640,3)):
         self.df = np.zeros(sz, dtype=np.uint8)
@@ -418,6 +449,30 @@ class FrameBuf:
             with self.lock: self.cf = f.copy()
     def get(self): return self.cf.copy()
 
+# 新增：绘制缓存类，提升性能
+class DrawCache:
+    """绘制缓存类，减少重复计算"""
+    def __init__(self, cfg):
+        self.cfg = cfg
+        self.label_cache = {}  # 缓存标签尺寸
+        self.color_cache = {}  # 缓存跟踪ID颜色
+
+    def get_label_size(self, text):
+        """缓存标签文字尺寸"""
+        if text not in self.label_cache:
+            size = cv2.getTextSize(
+                text, cv2.FONT_HERSHEY_SIMPLEX,
+                self.cfg.det_label_font_scale, 1
+            )[0]
+            self.label_cache[text] = size
+        return self.label_cache[text]
+
+    def get_track_color(self, track_id):
+        """缓存跟踪ID颜色"""
+        if track_id not in self.color_cache:
+            self.color_cache[track_id] = ((track_id*59)%256, (track_id*127)%256, (track_id*199)%256)
+        return self.color_cache[track_id]
+
 class FPS:
     def __init__(self, ws=15):
         self.ws = ws; self.times = []; self.fps =0.0
@@ -427,67 +482,124 @@ class FPS:
         if len(self.times)>=2: self.fps = (len(self.times)-1)/(self.times[-1]-self.times[0])
         return self.fps
 
+# 核心修改：自定义检测框绘制（匹配截图样式）
 def draw(img, boxes, ids, cls_ids, tracks, fps=0.0, det_cnt=0, cfg=None, w="clear", perf=None):
-    if not valid_img(img): return np.zeros((480,640,3), dtype=np.uint8)
-    cfg = cfg or Config(); di = img.copy()
-    ov = di.copy(); cv2.rectangle(ov, (10,10), (800,80), (0,0,0), -1)
+    if not valid_img(img): 
+        return np.zeros((480,640,3), dtype=np.uint8)
+    cfg = cfg or Config()
+    di = img.copy()
+    draw_cache = DrawCache(cfg)  # 初始化绘制缓存
+    
+    # 1. 绘制顶部信息栏（性能/天气/计数）
+    ov = di.copy()
+    cv2.rectangle(ov, (10,10), (800,80), (0,0,0), -1)
     cv2.addWeighted(ov,0.7,di,0.3,0,di)
+    
     sc = sum(1 for t in tracks if t.is_stopped) if tracks else 0
     oc = sum(1 for t in tracks if t.is_overtaking) if tracks else 0
     lc = sum(1 for t in tracks if t.is_lane_changing) if tracks else 0
     bc = sum(1 for t in tracks if t.is_braking) if tracks else 0
     dc = sum(1 for t in tracks if t.is_dangerous) if tracks else 0
-    lines = [f"FPS:{fps:.1f} | Weather:{w} | Tracks:{len(boxes)} | Dets:{det_cnt}",
-             f"Stop:{sc} | Overtake:{oc} | LaneChange:{lc} | Brake:{bc} | Danger:{dc}"]
-    if perf: lines.append(f"CPU:{perf['cpu']:.1f}% | MEM:{perf['mem']:.1f}% | GPU:{perf['gpu']:.1f}%")
+    
+    lines = [
+        f"FPS:{fps:.1f} | Weather:{w} | Tracks:{len(boxes)} | Dets:{det_cnt}",
+        f"Stop:{sc} | Overtake:{oc} | LaneChange:{lc} | Brake:{bc} | Danger:{dc}"
+    ]
+    if perf: 
+        lines.append(f"CPU:{perf['cpu']:.1f}% | MEM:{perf['mem']:.1f}% | GPU:{perf['gpu']:.1f}%")
+    
     for i, l in enumerate(lines):
         cv2.putText(di, l, (15,30+i*20), cv2.FONT_HERSHEY_SIMPLEX,0.6,(0,255,0),2,cv2.LINE_AA)
+
+    # 2. 绘制车辆检测框（核心：匹配截图样式）
     if boxes is not None and ids is not None and cls_ids is not None and tracks is not None:
         ml = min(len(boxes), len(ids), len(cls_ids), len(tracks))
         for i in range(ml):
             try:
-                b = boxes[i]; tid = ids[i]; cid = cls_ids[i]; t = tracks[i]
-                if b is None or len(b)!=4 or b[0]>=b[2] or b[1]>=b[3]: continue
-                x1,y1,x2,y2 = b
-                clr = ((tid*59)%256, (tid*127)%256, (tid*199)%256)
-                cv2.rectangle(di, (int(x1),int(y1)), (int(x2),int(y2)), clr,2,cv2.LINE_AA)
+                b = boxes[i]
+                tid = ids[i]
+                cid = cls_ids[i]
+                t = tracks[i]
+                
+                # 过滤无效框
+                if b is None or len(b)!=4 or b[0]>=b[2] or b[1]>=b[3]: 
+                    continue
+                
+                x1,y1,x2,y2 = map(int, b)
+                cls_name = VEHICLE_CLS.get(cid, "Unknown")
+                conf = t.conf if hasattr(t, 'conf') else 0.0
+                
+                # ========== 核心：自定义检测框（匹配截图） ==========
+                # 1. 绘制蓝色检测框（无透明度，实线）
+                cv2.rectangle(di, (x1, y1), (x2, y2), cfg.det_box_color, cfg.det_box_thickness, cv2.LINE_AA)
+                
+                # 2. 绘制标签（类别+置信度，黑底白字）
+                label = f"{cls_name} {conf:.2f}"
+                # 计算标签尺寸（缓存复用）
+                label_w, label_h = draw_cache.get_label_size(label)
+                # 绘制标签背景（紧贴框体顶部）
+                label_x1 = x1
+                label_y1 = y1 - label_h - 2*cfg.det_label_padding
+                label_x2 = x1 + label_w + 2*cfg.det_label_padding
+                label_y2 = y1
+                cv2.rectangle(
+                    di, (label_x1, label_y1), (label_x2, label_y2),
+                    cfg.det_label_bg_color, -1  # 实心背景
+                )
+                # 绘制标签文字
+                cv2.putText(
+                    di, label, 
+                    (x1 + cfg.det_label_padding, y1 - cfg.det_label_padding),
+                    cv2.FONT_HERSHEY_SIMPLEX, cfg.det_label_font_scale,
+                    cfg.det_label_text_color, 1, cv2.LINE_AA
+                )
+
+                # 3. 绘制跟踪ID（可选，绿色背景）
+                id_label = f"ID:{tid}"
+                id_w, id_h = cv2.getTextSize(id_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+                cv2.rectangle(
+                    di, (x1, label_y1 - id_h - 2*cfg.det_label_padding),
+                    (x1 + id_w + 2*cfg.det_label_padding, label_y1),
+                    (0, 255, 0), -1
+                )
+                cv2.putText(
+                    di, id_label,
+                    (x1 + cfg.det_label_padding, label_y1 - cfg.det_label_padding),
+                    cv2.FONT_HERSHEY_SIMPLEX, 0.4, (0,0,0), 1, cv2.LINE_AA
+                )
+
+                # 4. 行为标签（简化显示，红色背景）
+                behavior_tags = []
+                if t.is_stopped: behavior_tags.append("STOP")
+                if t.is_dangerous: behavior_tags.append("DANGER")
+                if behavior_tags:
+                    behavior_label = " | ".join(behavior_tags)
+                    bh_w, bh_h = cv2.getTextSize(behavior_label, cv2.FONT_HERSHEY_SIMPLEX, 0.4, 1)[0]
+                    cv2.rectangle(
+                        di, (x2 - bh_w - 2*cfg.det_label_padding, y1 - bh_h - 2*cfg.det_label_padding),
+                        (x2, y1), (0,0,255), -1
+                    )
+                    cv2.putText(
+                        di, behavior_label,
+                        (x2 - bh_w - cfg.det_label_padding, y1 - cfg.det_label_padding),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.4, (255,255,255), 1, cv2.LINE_AA
+                    )
+
+                # 5. 简化轨迹绘制（只绘制最近5帧，提升性能）
                 if t and len(t.track_hist)>=2:
-                    to = di.copy()
-                    for j in range(1, len(t.track_hist)):
-                        p1 = (int(t.track_hist[j-1][0]), int(t.track_hist[j-1][1]))
-                        p2 = (int(t.track_hist[j][0]), int(t.track_hist[j][1]))
-                        a = j/len(t.track_hist)*cfg.track_alpha
-                        lw = int(j/len(t.track_hist)*cfg.track_line_width)+1
-                        cv2.line(to, p1, p2, clr, lw, cv2.LINE_AA)
-                    cv2.addWeighted(to, a, di, 1-a,0,di)
-                if t and len(t.pred_traj)>=2:
-                    po = di.copy()
-                    for j in range(1, len(t.pred_traj)):
-                        p1 = (int(t.pred_traj[j-1][0]), int(t.pred_traj[j-1][1]))
-                        p2 = (int(t.pred_traj[j][0]), int(t.pred_traj[j][1]))
-                        cv2.line(po, p1, p2, (0,0,255),2,cv2.LINE_AA)
-                    cv2.addWeighted(po,0.5,di,0.5,0,di)
-                cn = VEHICLE_CLS.get(cid, "Unknown")
-                bt = []
-                if t.is_stopped: bt.append("STOP")
-                if t.is_overtaking: bt.append("OVERTAKE")
-                if t.is_lane_changing: bt.append("LANE_CHANGE")
-                if t.is_braking: bt.append("BRAKE")
-                if t.is_accelerating: bt.append("ACCEL")
-                if t.is_turning: bt.append("TURN")
-                if t.is_dangerous: bt.append("DANGER!")
-                bs = " | "+" | ".join(bt) if bt else ""
-                s = t._calc_speed() if hasattr(t,'_calc_speed') else 0.0
-                lbl = f"ID:{tid} | {cn} | {s:.1f}px/s{bs}"
-                ls = cv2.getTextSize(lbl, cv2.FONT_HERSHEY_SIMPLEX,0.4,1)[0]
-                ovl = di.copy()
-                cv2.rectangle(ovl, (int(x1),int(y1)-20), (int(x1)+ls[0]+20, int(y1)), clr,-1)
-                cv2.addWeighted(ovl,0.8,di,0.2,0,di)
-                cv2.putText(di, lbl, (int(x1)+5, int(y1)-5), cv2.FONT_HERSHEY_SIMPLEX,0.4,(255,255,255),1,cv2.LINE_AA)
-            except: continue
+                    hist = t.track_hist[-5:]
+                    for j in range(1, len(hist)):
+                        p1 = (int(hist[j-1][0]), int(hist[j-1][1]))
+                        p2 = (int(hist[j][0]), int(hist[j][1]))
+                        cv2.line(di, p1, p2, (0,255,0), 1, cv2.LINE_AA)
+
+            except Exception as e:
+                logger.warning(f"绘制检测框失败: {e}")
+                continue
+
     return di
 
-# 工具函数（完整保留+修复Actor销毁+碰撞检测）
+# ======================== 工具函数 ========================
 def clear_actors(world, exclude=None):
     ei = set(exclude) if exclude else set()
     actors = world.get_actors()
@@ -528,7 +640,7 @@ def spawn_npcs(world, num, sp):
                 cnt +=1
     return cnt
 
-# 新增：安全生成自车函数（解决碰撞问题）
+# 安全生成自车函数
 def safe_spawn_ego(world, spawn_points):
     """安全生成自车，避免碰撞"""
     ego_bp = random.choice(world.get_blueprint_library().filter('vehicle.tesla.model3'))
@@ -552,7 +664,7 @@ def safe_spawn_ego(world, spawn_points):
     print("❌ 无法生成自车，所有位置都有碰撞")
     return None
 
-# 主函数（完整保留+修复所有错误）
+# ======================== 主函数 ========================
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", help="配置文件路径")
@@ -568,13 +680,13 @@ def main():
     if args.conf_thres: cfg.conf_thres = args.conf_thres
     if args.weather and args.weather in WEATHER: cfg.default_weather = args.weather
 
-    # 初始化所有可能用到的变量（解决未定义错误）
+    # 初始化所有可能用到的变量
     ego = None
     cam = None
     lidar = None
     lidar_proc = None
     det_thread = None
-    vis = None  # 提前初始化，避免UnboundLocalError
+    vis = None
     recorder = Recorder(cfg)
 
     try:
@@ -607,7 +719,6 @@ def main():
             print("❌ 无可用生成点")
             return
         
-        # 安全生成自车（解决碰撞问题）
         ego = safe_spawn_ego(world, spawn_points)
         if ego is None:
             return
@@ -664,7 +775,7 @@ def main():
         cv2.namedWindow("CARLA Object Tracking", cv2.WINDOW_NORMAL)
         cv2.resizeWindow("CARLA Object Tracking", cfg.window_width, cfg.window_height)
 
-        # 初始化3D可视化（提前定义，避免未定义错误）
+        # 初始化3D可视化
         if cfg.use_3d_visualization and cfg.use_lidar and lidar_proc is not None:
             vis = o3d.visualization.Visualizer()
             vis.create_window(window_name="LiDAR Point Cloud", width=cfg.pcd_view_size, height=cfg.pcd_view_size)
@@ -679,7 +790,7 @@ def main():
         while True:
             world.tick()
             
-            # 帧率控制（非阻塞）
+            # 帧率控制
             current_time = time.time()
             elapsed = current_time - last_display_time
             target_interval = 1.0 / cfg.display_fps
@@ -717,7 +828,7 @@ def main():
             gpu = torch.cuda.utilization() if (torch.cuda.is_available() and hasattr(torch.cuda,'utilization')) else 0.0
             perf = {'cpu':cpu, 'mem':mem, 'gpu':gpu, 'fps':fps, 'avg_fps':fps}
             
-            # 绘制可视化
+            # 绘制可视化（使用新的检测框样式）
             di = draw(img, boxes, ids, cls_ids, tracker.tracks, fps=fps, det_cnt=len(dets), cfg=cfg, w=cw, perf=perf)
             cv2.imshow("CARLA Object Tracking", di)
             
@@ -754,7 +865,7 @@ def main():
     except Exception as e: 
         print(f"❌ 运行错误: {str(e)}")
     finally:
-        # 资源清理（安全检查）
+        # 资源清理
         print("🧹 开始清理资源...")
         
         # 停止检测线程
@@ -762,7 +873,7 @@ def main():
             det_thread.stop()
             det_thread.join(timeout=2.0)
         
-        # 关闭3D可视化窗口（先检查是否为None）
+        # 关闭3D可视化窗口
         if vis is not None:
             try:
                 vis.destroy_window()
@@ -775,7 +886,7 @@ def main():
         # 关闭数据记录
         recorder.close()
         
-        # 销毁LiDAR（存在性检查）
+        # 销毁LiDAR
         if lidar and lidar.is_alive:
             try: 
                 lidar.stop()
@@ -784,7 +895,7 @@ def main():
             except Exception as e:
                 print(f"⚠️ 销毁LiDAR失败: {e}")
         
-        # 销毁相机（存在性检查）
+        # 销毁相机
         if cam and cam.is_alive:
             try: 
                 cam.stop()
@@ -793,7 +904,7 @@ def main():
             except Exception as e:
                 print(f"⚠️ 销毁相机失败: {e}")
         
-        # 销毁自车（存在性检查）
+        # 销毁自车
         if ego and ego.is_alive:
             try: 
                 ego.destroy()
