@@ -927,5 +927,5 @@ if __name__ == "__main__":
     logger.add(sys.stdout, format="<green>{time:HH:mm:ss}</green> | <level>{level: <8}</level> | <level>{message}</level>", level="INFO")
     logger.add(f"track_log_{datetime.now().strftime('%Y%m%d_%H%M%S')}.log", rotation="100 MB", retention="7 days", format="{time:YYYY-MM-DD HH:mm:ss} | {level: <8} | {message}", level="DEBUG")
     
-    # 启动主程序
+    # 然后启动主程序
     main()
